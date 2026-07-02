@@ -3,6 +3,7 @@ package com.its.gestionepagamentirestclient.service;
 import com.its.gestionepagamentirestclient.config.RabbitMQConfig;
 import com.its.gestionepagamentirestclient.dto.PaymentRequest;
 import com.its.gestionepagamentirestclient.dto.PaymentResponse;
+import com.its.gestionepagamentirestclient.exception.InvalidFileException;
 import com.its.gestionepagamentirestclient.exception.PaymentFailedException;
 import com.its.gestionepagamentirestclient.mapper.PaymentMapper;
 import com.its.gestionepagamentirestclient.model.Payment;
@@ -14,6 +15,7 @@ import org.slf4j.MDC;
 import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -26,6 +28,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Service class handling the core business logic for payment processing.
@@ -42,11 +45,15 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final PaymentMapper paymentMapper;
     private final RabbitTemplate rabbitTemplate;
+    private final PaymentUploadService paymentUploadService;
+
+    private static final long MAX_CHECK_FILE_SIZE = 5L * 1024 * 1024;
 
     public PaymentResponse processPayment(PaymentRequest request) {
         return processPayment(request, null);
     }
 
+    public PaymentResponse processPaymentWithCheck(PaymentRequest request, MultipartFile file) { return processPaymentWithCheck(request, file, null); }
     /**
      * Processes an incoming payment request by mapping it to a database entity,
      * simulating a bank authorization check, persisting the result, and publishing
@@ -82,6 +89,53 @@ public class PaymentService {
         } catch (Exception e) {
             log.error("event=payment_processing_failed orderId={}", request.getOrderId(), e);
             throw new PaymentFailedException("Failed to process payment for order " + request.getOrderId());
+        }
+    }
+
+    public PaymentResponse processPaymentWithCheck(PaymentRequest request, MultipartFile file, String correlationId) {
+        validateCheckFile(file);
+
+        try {
+            Payment payment = buildPayment(request);
+            StatusEnum bankStatus = resolvePaymentStatus();
+            StatusEnum finalStatus = StatusEnum.DECLINED;
+            String receiptKey = null;
+
+            if (bankStatus == StatusEnum.ACCEPTED) {
+                String userId = MDC.get("caller");
+                String orderId = request.getOrderId().toString();
+
+                paymentUploadService.uploadCheck(userId, orderId, file.getBytes()).get(10, TimeUnit.SECONDS);
+                receiptKey = paymentUploadService.buildReceiptKey(userId, orderId);
+                finalStatus = StatusEnum.ACCEPTED;
+            }
+
+            payment.setStatus(finalStatus);
+            payment.setReceipt(receiptKey);
+
+            Payment savedPayment = paymentRepository.save(payment);
+            PaymentResponse response = paymentMapper.toResponse(savedPayment);
+
+            publishPaymentResult(response, correlationId);
+            return response;
+        } catch (Exception e) {
+            log.error("event=payment_processing_failed orderId={}", request.getOrderId(), e);
+            throw new PaymentFailedException("Failed to process payment for order " + request.getOrderId());
+        }
+    }
+
+    private void validateCheckFile(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new InvalidFileException("Check file is required");
+        }
+
+        if (file.getSize() > MAX_CHECK_FILE_SIZE) {
+            throw new InvalidFileException("Check file exceeds the 5MB limit");
+        }
+
+        String name = file.getOriginalFilename();
+        if (name == null || !name.toLowerCase().endsWith(".pdf")) {
+            throw new InvalidFileException("Only PDF files are allowed");
         }
     }
 
